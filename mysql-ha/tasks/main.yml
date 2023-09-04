@@ -1,0 +1,177 @@
+---
+# tasks file for mysql-ha
+- name: Install dependency
+  apt:
+    name: "{{ packages3 }}"
+    update_cache: yes
+  vars:
+    packages3:
+    - mysql-server
+    - mysql-client
+    - python3-pymysql
+      #- python-pymysql
+    - python-dev-is-python3
+    - gcc
+    - python3-pip
+    - python3-dev
+- name: copy credentials.cnf
+  template:
+    src: credentials.cnf.j2
+    dest: "/root/.my.cnf"
+    owner: root
+    group: root
+    mode: 0644      
+- name: copy bd1.cnf
+  when: inventory_hostname in groups['db1']
+  template:
+    src: my.cnf.j2
+    dest: "/etc/mysql/mysql.conf.d/mysqld.cnf"
+    owner: root
+    group: root
+    mode: 0644
+- name: copy db2.cnf
+  when: inventory_hostname in groups['db2']
+  template:
+    src: my2.cnf.j2
+    dest: "/etc/mysql/mysql.conf.d/mysqld.cnf"
+    owner: root
+    group: root
+    mode: 0644
+- name: Restart service mysqld, in all cases, also issue daemon-reload to pick up config changes
+  ansible.builtin.systemd:
+    state: restarted
+    daemon_reload: true
+    name: mysql
+    enabled: true
+- name: test mysql_secure_installation
+  mysql_secure_installation:
+    login_password: ''
+    new_password: '{{ db_user_passwd }}' 
+    user: root
+    login_host: localhost
+    hosts: ['localhost', '127.0.0.1', '::1', '{{  db1_ip }}', '{{ db2_ip }}', '{{ control_machine_ip }}' ]
+    change_root_password: true
+    remove_anonymous_user: true
+    disallow_root_login_remotely: false
+    remove_test_db: true
+  register: mysql_secure
+  
+# To see detailed output
+- debug:
+    var: mysql_secure
+- name: Create a new database with name '{{ db_name }}'
+  when: inventory_hostname in groups['db2']
+  community.mysql.mysql_db:
+    name: '{{ db_name }}'
+    state: present
+    login_unix_socket: /run/mysqld/mysqld.sock
+- name: Create database user with name '{{ db_user }}' and password '{{ db_user_passwd }}' with all database privileges
+  community.mysql.mysql_user:
+    name: "{{ db_user }}"
+    password: "{{ db_user_passwd }}"
+    priv: '*.*:ALL,GRANT'
+    state: present
+    host: "{{ item }}"
+    login_unix_socket: /run/mysqld/mysqld.sock
+  with_items:
+    - "localhost"
+    - "{{ db1_ip }}"
+    - "{{ db2_ip }}"
+    - "{{ control_machine_ip }}"
+- name: Specify grants composed of more than one word
+  community.mysql.mysql_user:
+    name: "{{ db_user }}"
+    password: "{{ db_user_passwd }}"
+    priv: "*.*:REPLICATION CLIENT"
+    host: "{{ item }}"
+    state: present
+    login_unix_socket: /run/mysqld/mysqld.sock
+  with_items:
+    - "localhost"
+    - "{{ db1_ip }}"
+    - "{{ db2_ip }}"
+    - "{{ control_machine_ip }}"
+- name: Specify grants composed of more than one word
+  community.mysql.mysql_user:
+    name: "{{ db_user }}"
+    password: "{{ db_user_passwd }}"
+    priv: "*.*:REPLICATION SLAVE"
+    host: "{{ item }}"
+    state: present
+    login_unix_socket: /run/mysqld/mysqld.sock
+  with_items:
+    - "localhost"
+    - "{{ db1_ip }}"
+    - "{{ db2_ip }}"
+    - "{{ control_machine_ip }}"
+- name: Execute SHOW MASTER STATUS DB1
+  when: inventory_hostname in groups['db1']
+  ansible.builtin.shell: "mysql -u root -p'{{ db_user_passwd }}' -e 'SHOW MASTER STATUS;'"
+  register: mysql_master_status_db1
+  ignore_errors: yes
+  changed_when: false
+- name: Extract Position and File of DB1
+  set_fact:
+    mysql_position_db1: "{{ mysql_master_status_db1.stdout_lines[1].split('\t')[1] }}"
+    mysql_file_db1: "{{ mysql_master_status_db1.stdout_lines[1].split('\t')[0] }}"
+  when: inventory_hostname in groups['db1']
+- name: Display MySQL Master Status DB1
+  debug:
+    msg: "File: {{ mysql_file_db1 }}, Position: {{ mysql_position_db1 }}"
+  when: inventory_hostname in groups['db1']
+- name: slave stop
+  when: inventory_hostname in groups['db2']
+  community.mysql.mysql_replication:
+    mode: stopreplica
+    login_unix_socket: /run/mysqld/mysqld.sock
+- name: replication set
+  when: inventory_hostname in groups['db2']
+  mysql_replication:
+    mode: changeprimary
+    master_host: "{{ db1_ip }}"
+    master_user: "{{ db_user }}"
+    master_password: "{{ db_user_passwd }}"
+    master_log_file: "{{ hostvars['db1'].mysql_file_db1 }}"
+    master_log_pos: "{{ hostvars['db1'].mysql_position_db1 }}"
+    login_unix_socket: /run/mysqld/mysqld.sock
+- name: slave start
+  when: inventory_hostname in groups['db2']
+  mysql_replication:
+    mode: startreplica
+    login_unix_socket: /run/mysqld/mysqld.sock
+- name: Execute SHOW MASTER STATUS DB2
+  when: inventory_hostname in groups['db2']
+  ansible.builtin.shell: "mysql -u root -p'{{ db_user_passwd }}' -e 'SHOW MASTER STATUS;'"
+  register: mysql_master_status_db2
+  ignore_errors: yes
+  changed_when: false
+- name: Extract Position and File of DB2
+  set_fact:
+    mysql_position_db2: "{{ mysql_master_status_db2.stdout_lines[1].split('\t')[1] }}"
+    mysql_file_db2: "{{ mysql_master_status_db2.stdout_lines[1].split('\t')[0] }}"
+  when: inventory_hostname in groups['db2']
+- name: Display MySQL Master Status DB2
+  debug:
+    msg: "File: {{ mysql_file_db2 }}, Position: {{ mysql_position_db2 }}"
+  when: inventory_hostname in groups['db2']
+- name: slave stop
+  when: inventory_hostname in groups['db1']
+  community.mysql.mysql_replication:
+    mode: stopreplica
+    login_unix_socket: /run/mysqld/mysqld.sock
+- name: replication set
+  when: inventory_hostname in groups['db1']
+  mysql_replication:
+    mode: changeprimary
+    master_host: "{{ db2_ip }}"
+    master_user: "{{ db_user }}"
+    master_password: "{{ db_user_passwd }}"
+    master_log_file: "{{ hostvars['db2'].mysql_file_db2 }}"
+    master_log_pos: "{{ hostvars['db2'].mysql_position_db2 }}"
+    login_unix_socket: /run/mysqld/mysqld.sock
+- name: slave start
+  when: inventory_hostname in groups['db1']
+  mysql_replication:
+    mode: startreplica
+    login_unix_socket: /run/mysqld/mysqld.sock
+
